@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Prepare IO
     let stdin = io::stdin();
     let mut line_iter = stdin.lock().lines();
-    let mut stdout = io::stdout();
+    let mut stdout_lock = io::stdout().lock();
 
     // 5. State Initialization
     let mut frame_count: u64 = 0;
@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = surface.read_pixels(&info, &mut pixel_buffer, row_bytes, (0, 0));
         }
 
-        if stdout.write_all(&pixel_buffer).is_err() {
+        if stdout_lock.write_all(&pixel_buffer).is_err() {
             break;
         }
 
