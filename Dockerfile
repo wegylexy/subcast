@@ -1,4 +1,4 @@
-FROM rust:1.92.0 AS build
+FROM rust:1.97.1 AS build
 WORKDIR /usr/src/subcast
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs

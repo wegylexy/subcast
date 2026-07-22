@@ -1,6 +1,6 @@
 use skia_safe::{
     AlphaType, BlurStyle, Color, ColorType, Data, Font, FontMgr, ImageInfo, MaskFilter, Paint,
-    Point, Surface, surfaces,
+    Point, Surface, Typeface, surfaces,
 };
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -31,6 +31,100 @@ struct Subtitle {
     start: u64,
     end: u64,
     lines: Vec<String>,
+}
+
+/// A single styled run of text within a subtitle line.
+struct TextRun {
+    text: String,
+    bold: bool,
+    italic: bool,
+}
+
+/// Core run-parser. Accepts and returns depth counters so callers can thread
+/// state across multiple segments (e.g. display lines separated by `"   "`).
+///
+/// Each `<b>` / `<i>` increments a depth counter; each `</b>` / `</i>` decrements
+/// it (floor 0). Bold/italic is active while the respective depth > 0. This means:
+///
+/// - Nesting order doesn't matter: `<b><i>` ≡ `<i><b>`
+/// - Wrong close order is tolerated: `<b><i>T</b></i>` renders T as bold+italic
+/// - Unmatched open tag: style stays active to end of string
+/// - Unmatched close tag: depth saturates at 0, no panic
+/// - Double open: `<b><b>T</b>more</b>` — T and "more" both bold (unlike a
+///   simple bool flip, which would drop bold after the first `</b>`)
+/// - Flush happens before decrement: at `</b>`, buffered text is emitted with
+///   the style that was active *before* the tag, then the counter drops.
+fn parse_runs_stateful(
+    input: &str,
+    mut bold_depth: u32,
+    mut italic_depth: u32,
+) -> (Vec<TextRun>, u32, u32) {
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut current_text = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            // Collect everything up to the closing '>'
+            let mut tag = String::new();
+            for c in chars.by_ref() {
+                if c == '>' {
+                    break;
+                }
+                tag.push(c);
+            }
+            // Flush any accumulated text as a run before changing style
+            if !current_text.is_empty() {
+                runs.push(TextRun {
+                    text: current_text.clone(),
+                    bold: bold_depth > 0,
+                    italic: italic_depth > 0,
+                });
+                current_text.clear();
+            }
+            match tag.as_str() {
+                "b"  => bold_depth += 1,
+                "/b" => bold_depth = bold_depth.saturating_sub(1),
+                "i"  => italic_depth += 1,
+                "/i" => italic_depth = italic_depth.saturating_sub(1),
+                _    => {} // unknown tags (e.g. <c.color>, <ruby>) are ignored
+            }
+        } else {
+            current_text.push(ch);
+        }
+    }
+
+    if !current_text.is_empty() {
+        runs.push(TextRun {
+            text: current_text,
+            bold: bold_depth > 0,
+            italic: italic_depth > 0,
+        });
+    }
+
+    (runs, bold_depth, italic_depth)
+}
+
+/// Parse a single string into styled runs, starting from unstyled state.
+/// Convenience wrapper around `parse_runs_stateful` for standalone use and tests.
+fn parse_runs(input: &str) -> Vec<TextRun> {
+    parse_runs_stateful(input, 0, 0).0
+}
+
+/// Build a Skia `Font` for the given style using synthetic bold/italic —
+/// the same synthesis that SVG/CSS applies when no separate variant file exists:
+///   bold   → `set_embolden(true)`          (stroke widening)
+///   italic → `set_skew_x(-0.25)`           (horizontal shear ≈ tan 14°, matching CSS oblique)
+fn styled_font(typeface: &Typeface, size: f32, bold: bool, italic: bool) -> Font {
+    let mut font = Font::new(typeface.clone(), size);
+    if bold {
+        font.set_embolden(true);
+    }
+    if italic {
+        // -0.25 matches the shear browsers apply for synthetic italic in SVG/CSS
+        font.set_skew_x(-0.25);
+    }
+    font
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +159,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let typeface = font_mgr
         .new_from_data(&font_data, None)
         .expect("Failed to parse font");
-    let font = Font::new(typeface, config.font_size);
+
+    // Compute line height once from the base (unstyled) font
+    let line_height = Font::new(typeface.clone(), config.font_size).spacing()
+        * config.line_height_multiplier;
 
     // 4. Prepare IO
     let stdin = io::stdin();
@@ -141,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(sub) = &active_sub {
             let key = (sub.start, sub.end);
             if last_rendered_key != Some(key) {
-                draw_subtitle(&mut surface, sub, &config, &font);
+                draw_subtitle(&mut surface, sub, &config, &typeface, line_height);
                 last_rendered_key = Some(key);
                 is_cleared = false;
                 needs_read = true;
@@ -160,7 +257,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // --- Output ---
         if needs_read {
-            // Read pixels from surface into our buffer
             let _ = surface.read_pixels(&info, &mut pixel_buffer, row_bytes, (0, 0));
         }
 
@@ -191,11 +287,15 @@ fn parse_line(line: &str) -> Option<Subtitle> {
     Some(Subtitle { start, end, lines })
 }
 
-fn draw_subtitle(surface: &mut Surface, sub: &Subtitle, config: &Config, font: &Font) {
+fn draw_subtitle(
+    surface: &mut Surface,
+    sub: &Subtitle,
+    config: &Config,
+    typeface: &Typeface,
+    line_height: f32,
+) {
     let canvas = surface.canvas();
     canvas.clear(Color::TRANSPARENT);
-
-    let line_height = font.spacing() * config.line_height_multiplier;
 
     // Shadow Setup
     let mut shadow_paint = Paint::default();
@@ -207,7 +307,6 @@ fn draw_subtitle(surface: &mut Surface, sub: &Subtitle, config: &Config, font: &
     ));
     shadow_paint.set_anti_alias(true);
     if config.shadow_blur > 0.0 {
-        // Convert radius to sigma
         let sigma = config.shadow_blur / 2.0;
         shadow_paint.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, sigma, false));
     }
@@ -222,19 +321,372 @@ fn draw_subtitle(surface: &mut Surface, sub: &Subtitle, config: &Config, font: &
     let off_x = config.shadow_distance * rad.cos();
     let off_y = config.shadow_distance * rad.sin();
 
+    // Thread bold/italic depth across display lines so that a tag opened on
+    // line 1 remains active on line 2, matching WebVTT cue-body semantics.
+    let mut bold_depth: u32 = 0;
+    let mut italic_depth: u32 = 0;
+
     for (i, line) in sub.lines.iter().enumerate() {
         let line_index_from_bottom = (sub.lines.len() - 1 - i) as f32;
         let y = config.baseline as f32 - (line_index_from_bottom * line_height);
 
-        let width = font.measure_text(line, Some(&text_paint)).0;
-        let x = (config.width as f32 - width) / 2.0;
+        let runs;
+        (runs, bold_depth, italic_depth) =
+            parse_runs_stateful(line, bold_depth, italic_depth);
 
-        // Draw Shadow
-        if config.shadow_opacity > 0.0 {
-            canvas.draw_str(line, Point::new(x + off_x, y + off_y), font, &shadow_paint);
+        // Measure total line width for horizontal centering
+        let total_width: f32 = runs
+            .iter()
+            .map(|run| {
+                styled_font(typeface, config.font_size, run.bold, run.italic)
+                    .measure_text(&run.text, Some(&text_paint))
+                    .0
+            })
+            .sum();
+
+        let mut x = (config.width as f32 - total_width) / 2.0;
+
+        for run in &runs {
+            let font = styled_font(typeface, config.font_size, run.bold, run.italic);
+            let run_width = font.measure_text(&run.text, Some(&text_paint)).0;
+
+            // Draw Shadow
+            if config.shadow_opacity > 0.0 {
+                canvas.draw_str(
+                    &run.text,
+                    Point::new(x + off_x, y + off_y),
+                    &font,
+                    &shadow_paint,
+                );
+            }
+
+            // Draw Text
+            canvas.draw_str(&run.text, Point::new(x, y), &font, &text_paint);
+
+            x += run_width;
         }
+    }
+}
 
-        // Draw Text
-        canvas.draw_str(line, Point::new(x, y), font, &text_paint);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: assert a run has the expected text and style flags.
+    fn check(run: &TextRun, text: &str, bold: bool, italic: bool) {
+        assert_eq!(run.text, text, "text mismatch");
+        assert_eq!(run.bold, bold, "bold mismatch for {:?}", run.text);
+        assert_eq!(run.italic, italic, "italic mismatch for {:?}", run.text);
+    }
+
+    // -----------------------------------------------------------------------
+    // Basic cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plain_text() {
+        // No tags → single unstyled run.
+        let runs = parse_runs("Hello world");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "Hello world", false, false);
+    }
+
+    #[test]
+    fn empty_string() {
+        // Empty input → no runs.
+        let runs = parse_runs("");
+        assert_eq!(runs.len(), 0);
+    }
+
+    #[test]
+    fn only_tags_no_text() {
+        // Tags with no text content between them → no runs.
+        let runs = parse_runs("<b></b>");
+        assert_eq!(runs.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-style cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bold_only() {
+        // <b>text</b> → one bold run.
+        let runs = parse_runs("<b>bold</b>");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "bold", true, false);
+    }
+
+    #[test]
+    fn italic_only() {
+        // <i>text</i> → one italic run.
+        let runs = parse_runs("<i>italic</i>");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "italic", false, true);
+    }
+
+    #[test]
+    fn bold_around_plain() {
+        // Text before and after bold span → three runs.
+        let runs = parse_runs("Hello <b>world</b>!");
+        assert_eq!(runs.len(), 3);
+        check(&runs[0], "Hello ", false, false);
+        check(&runs[1], "world", true, false);
+        check(&runs[2], "!", false, false);
+    }
+
+    #[test]
+    fn italic_around_plain() {
+        let runs = parse_runs("see <i>note</i> here");
+        assert_eq!(runs.len(), 3);
+        check(&runs[0], "see ", false, false);
+        check(&runs[1], "note", false, true);
+        check(&runs[2], " here", false, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Nesting order — must be identical
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bold_then_italic_nested() {
+        // <b><i>T</i></b>  →  T is bold+italic.
+        let runs = parse_runs("<b><i>T</i></b>");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "T", true, true);
+    }
+
+    #[test]
+    fn italic_then_bold_nested() {
+        // <i><b>T</b></i>  →  same result; nesting order is irrelevant.
+        let runs = parse_runs("<i><b>T</b></i>");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "T", true, true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wrong close order — must tolerate gracefully
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrong_close_order_bi() {
+        // <b><i>T</b></i>  — </b> arrives while italic is still open.
+        // Both were open when T was accumulated, so T is bold+italic.
+        // After </b>: bold_depth=0, italic_depth=1 (italic still logically open).
+        // After </i>: italic_depth=0.
+        let runs = parse_runs("<b><i>T</b></i>");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "T", true, true);
+    }
+
+    #[test]
+    fn wrong_close_order_ib() {
+        // <i><b>T</i></b>  — symmetric to the above.
+        let runs = parse_runs("<i><b>T</i></b>");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "T", true, true);
+    }
+
+    #[test]
+    fn wrong_close_order_with_tail() {
+        // <b><i>A</b>B</i>  →  A=bold+italic, B=italic (bold depth dropped to 0).
+        let runs = parse_runs("<b><i>A</b>B</i>");
+        assert_eq!(runs.len(), 2);
+        check(&runs[0], "A", true, true);
+        check(&runs[1], "B", false, true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unmatched tags
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unmatched_open_bold() {
+        // <b>text  — no closing tag; style stays active to end of string.
+        let runs = parse_runs("<b>bold forever");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "bold forever", true, false);
+    }
+
+    #[test]
+    fn unmatched_open_italic() {
+        let runs = parse_runs("<i>italic forever");
+        assert_eq!(runs.len(), 1);
+        check(&runs[0], "italic forever", false, true);
+    }
+
+    #[test]
+    fn unmatched_close_bold() {
+        // </b> with nothing open → depth saturates at 0, no panic, text is plain.
+        let runs = parse_runs("text</b>more");
+        assert_eq!(runs.len(), 2);
+        check(&runs[0], "text", false, false);
+        check(&runs[1], "more", false, false);
+    }
+
+    #[test]
+    fn unmatched_close_italic() {
+        let runs = parse_runs("text</i>more");
+        assert_eq!(runs.len(), 2);
+        check(&runs[0], "text", false, false);
+        check(&runs[1], "more", false, false);
+    }
+
+    #[test]
+    fn unmatched_close_does_not_affect_open() {
+        // <b>A</i>B</b>  — the stray </i> decrements italic_depth (already 0,
+        // saturates).  Bold is unaffected; A and B are both bold.
+        let runs = parse_runs("<b>A</i>B</b>");
+        assert_eq!(runs.len(), 2);
+        check(&runs[0], "A", true, false);
+        check(&runs[1], "B", true, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Double-open (key difference from boolean approach)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn double_open_bold() {
+        // <b><b>T</b>more</b>  — first </b> drops depth to 1 (still bold),
+        // second </b> drops to 0.  "more" must remain bold.
+        // A simple bool flip would incorrectly make "more" plain.
+        let runs = parse_runs("<b><b>T</b>more</b>");
+        assert_eq!(runs.len(), 2);
+        check(&runs[0], "T", true, false);
+        check(&runs[1], "more", true, false); // depth counter keeps bold active
+    }
+
+    #[test]
+    fn double_open_italic() {
+        let runs = parse_runs("<i><i>T</i>more</i>");
+        assert_eq!(runs.len(), 2);
+        check(&runs[0], "T", false, true);
+        check(&runs[1], "more", false, true);
+    }
+
+    #[test]
+    fn double_open_bold_italic_mixed() {
+        // <b><i><b>T</b>mid</i>tail</b>
+        // After opening: bold_depth=2, italic_depth=1.
+        // Flush always captures the state BEFORE the closing tag decrements:
+        //   </b>  → flush "T"   as B+I (depths 2,1 → both >0), then bold_depth=1
+        //   </i>  → flush "mid" as B+I (depths 1,1 → both >0), then italic_depth=0
+        //   </b>  → flush "tail" as B   (depths 1,0), then bold_depth=0
+        let runs = parse_runs("<b><i><b>T</b>mid</i>tail</b>");
+        assert_eq!(runs.len(), 3);
+        check(&runs[0], "T",    true, true);
+        check(&runs[1], "mid",  true, true);  // italic still open at flush time
+        check(&runs[2], "tail", true, false);
+    }
+
+    #[test]
+    fn state_threads_across_display_lines() {
+        // In draw_subtitle, parse_runs_stateful is called for each display line
+        // with the depths carried over from the previous line.
+        // An unclosed <b> on line 1 MUST remain active on line 2.
+        let (line1, b, i) = parse_runs_stateful("<b>bold and unclosed", 0, 0);
+        assert_eq!(line1.len(), 1);
+        check(&line1[0], "bold and unclosed", true, false);
+        // depths thread into the next line
+        let (line2, _, _) = parse_runs_stateful("still bold", b, i);
+        assert_eq!(line2.len(), 1);
+        check(&line2[0], "still bold", true, false); // bold carries over
+    }
+
+    #[test]
+    fn state_resets_when_closed_before_line_break() {
+        // If the tag IS properly closed before the line break, line 2 is plain.
+        let (line1, b, i) = parse_runs_stateful("<b>bold</b>", 0, 0);
+        assert_eq!(line1.len(), 1);
+        check(&line1[0], "bold", true, false);
+        assert_eq!(b, 0); // tag was closed
+        let (line2, _, _) = parse_runs_stateful("plain", b, i);
+        assert_eq!(line2.len(), 1);
+        check(&line2[0], "plain", false, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mixed / real-world patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mixed_segments() {
+        // Alternating plain, bold, plain, italic, plain.
+        let runs = parse_runs("plain <b>bold</b> middle <i>italic</i> end");
+        assert_eq!(runs.len(), 5);
+        check(&runs[0], "plain ", false, false);
+        check(&runs[1], "bold", true, false);
+        check(&runs[2], " middle ", false, false);
+        check(&runs[3], "italic", false, true);
+        check(&runs[4], " end", false, false);
+    }
+
+    #[test]
+    fn bold_italic_adjacent() {
+        // <b>A</b><i>B</i>  — two separate styled spans with no gap text.
+        let runs = parse_runs("<b>A</b><i>B</i>");
+        assert_eq!(runs.len(), 2);
+        check(&runs[0], "A", true, false);
+        check(&runs[1], "B", false, true);
+    }
+
+    #[test]
+    fn unknown_tag_ignored_text_preserved() {
+        // <c.color> is a WebVTT colour class tag; text content must be kept.
+        let runs = parse_runs("a<c.color>b</c.color>c");
+        assert_eq!(runs.len(), 3);
+        check(&runs[0], "a", false, false);
+        check(&runs[1], "b", false, false);
+        check(&runs[2], "c", false, false);
+    }
+
+    #[test]
+    fn unknown_tag_inside_bold() {
+        // Unknown tag between bold tags must not disturb bold state.
+        let runs = parse_runs("<b>A<c.x>B</c.x>C</b>");
+        assert_eq!(runs.len(), 3);
+        check(&runs[0], "A", true, false);
+        check(&runs[1], "B", true, false);
+        check(&runs[2], "C", true, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_line
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_line_valid() {
+        let sub = parse_line("1000\t2000\tHello world").unwrap();
+        assert_eq!(sub.start, 1000);
+        assert_eq!(sub.end, 2000);
+        assert_eq!(sub.lines, vec!["Hello world"]);
+    }
+
+    #[test]
+    fn parse_line_multiple_lines() {
+        let sub = parse_line("0\t5000\tLine one   Line two").unwrap();
+        assert_eq!(sub.lines.len(), 2);
+        assert_eq!(sub.lines[0], "Line one");
+        assert_eq!(sub.lines[1], "Line two");
+    }
+
+    #[test]
+    fn parse_line_with_inline_tags() {
+        // parse_line preserves tags verbatim; parse_runs handles them at render time.
+        let sub = parse_line("0\t3000\t<b>Bold</b> text").unwrap();
+        assert_eq!(sub.lines[0], "<b>Bold</b> text");
+    }
+
+    #[test]
+    fn parse_line_too_few_fields() {
+        assert!(parse_line("bad input").is_none());
+        assert!(parse_line("1000\t2000").is_none());
+    }
+
+    #[test]
+    fn parse_line_non_numeric_timestamps() {
+        assert!(parse_line("abc\t2000\ttext").is_none());
+        assert!(parse_line("1000\txyz\ttext").is_none());
     }
 }
