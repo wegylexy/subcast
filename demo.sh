@@ -47,12 +47,22 @@ echo "Generating: $OUTPUT"
 
 # Each line: startMS <TAB> endMS <TAB> text
 # Three spaces (   ) separate display lines within one subtitle.
+#
+# The Thai lines below are a stacked-combining-mark regression check: each
+# word carries two marks that must stack vertically (e.g. a tone mark above
+# a vowel sign already above the base consonant). Naive glyph placement
+# (cmap lookup with no OpenType GPOS) renders the top mark missing or
+# overlapping instead of stacked — see CLAUDE.md's shaping note.
 printf '%s\n' \
   $'0\t2000\tPlain text subtitle' \
   $'2000\t4000\t<b>Bold</b> text' \
   $'4000\t6000\t<i>Italic</i> text' \
   $'6000\t8000\t<b><i>Bold italic</i></b> combined' \
   $'8000\t10000\tMixed: <b>bold</b> and <i>italic</i>   second line here' \
+  $'10000\t12000\tเพื่อน' \
+  $'12000\t14000\tนั้น' \
+  $'14000\t16000\tซึ่ง' \
+  $'16000\t18000\tเนื้อหา' \
 | FONT_PATH="$FONT_PATH" \
   FPS=25 WIDTH=1920 HEIGHT=1080 BASELINE=1026 FONT_SIZE=60 \
   SHADOW_DISTANCE=3 SHADOW_BLUR=6 SHADOW_OPACITY=0.75 \

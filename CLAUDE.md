@@ -86,6 +86,13 @@ bash demo.sh              # Linux/macOS/WSL — auto-detects system font
 | Skia for rendering | High-quality text shaping, kerning, subpixel antialiasing |
 | **FPS=25 default** | A subtitle appears on the first frame where `now_ms ≥ start_ms`, so exact frame alignment requires `start_ms` to be a multiple of `1000/fps` ms. At 25 fps the step is **40 ms** (exact in f64), so `now_ms` is always a clean integer — no float truncation. At 24/30/60 fps the step is a repeating decimal, adding up to ~0.67/0.33/0.17 ms of truncation wobble per frame. In all cases a subtitle at an arbitrary ms timestamp may appear up to one full frame late. |
 
+## Line Height & Font Spacing Note
+
+`subcast` (Skia) calculates line height via `font.spacing() * LINE_HEIGHT`:
+- `font.spacing()` in Skia queries native font design metrics (`ascent + descent + leading`).
+- For standard Latin fonts like `Helvetica-Bold.otf` at `FONT_SIZE=60`, `font.spacing()` is ~60px, so `LINE_HEIGHT=1.0` produces 60px line spacing.
+- **Browser SVG vs. Skia**: Web browsers cannot query internal font ascent/descent metrics directly in JS. Web preview editors (e.g. `subtitle-editor`) may use higher visual `lineHeight` parameters for non-Latin fonts (e.g. `1.2` for Japanese/Chinese, `1.6` for Thai) to visually match Skia's native `font.spacing()` output. For `subcast` in `.gitlab-ci.yml`, `LINE_HEIGHT=1` is generally correct because Skia scales `font.spacing()` natively per font.
+
 ## Dependencies
 
 | Crate | Purpose |

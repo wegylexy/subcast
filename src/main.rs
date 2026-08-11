@@ -1,6 +1,8 @@
+use skia_safe::shaper::RunHandler;
+use skia_safe::shaper::run_handler::{Buffer, RunInfo};
 use skia_safe::{
     AlphaType, BlurStyle, Color, ColorType, Data, Font, FontMgr, ImageInfo, MaskFilter, Paint,
-    Point, Surface, Typeface, surfaces,
+    Point, Shaper, Surface, TextBlob, TextBlobBuilder, Typeface, surfaces,
 };
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -83,11 +85,11 @@ fn parse_runs_stateful(
                 current_text.clear();
             }
             match tag.as_str() {
-                "b"  => bold_depth += 1,
+                "b" => bold_depth += 1,
                 "/b" => bold_depth = bold_depth.saturating_sub(1),
-                "i"  => italic_depth += 1,
+                "i" => italic_depth += 1,
                 "/i" => italic_depth = italic_depth.saturating_sub(1),
-                _    => {} // unknown tags (e.g. <c.color>, <ruby>) are ignored
+                _ => {} // unknown tags (e.g. <c.color>, <ruby>) are ignored
             }
         } else {
             current_text.push(ch);
@@ -127,6 +129,72 @@ fn styled_font(typeface: &Typeface, size: f32, bold: bool, italic: bool) -> Font
     font
 }
 
+/// Practically-infinite shaping width: each display line is already a single
+/// line (line breaks are handled by the caller), so HarfBuzz must never wrap.
+const NO_WRAP_WIDTH: f32 = 1_000_000.0;
+
+/// Collects HarfBuzz's shaped glyph runs straight into a `TextBlobBuilder`,
+/// positioned relative to a y=0 baseline, while tracking the total x advance.
+///
+/// Skia's own `Shaper::shape_text_blob` convenience helper positions the
+/// first line's baseline at `offset.y - ascent` (it assumes `offset` is the
+/// top of a text box, like a paragraph layout) and its returned end-point is
+/// the *next line's* start position — always `x = 0` for single-line text.
+/// Neither behavior is usable here: we need an exact baseline origin and a
+/// real total-advance width to lay out multiple styled runs on one line.
+struct BlobCollector {
+    builder: TextBlobBuilder,
+    advance_x: f32,
+}
+
+impl BlobCollector {
+    fn new() -> Self {
+        Self {
+            builder: TextBlobBuilder::new(),
+            advance_x: 0.0,
+        }
+    }
+}
+
+impl RunHandler for BlobCollector {
+    fn begin_line(&mut self) {}
+    fn run_info(&mut self, _info: &RunInfo) {}
+    fn commit_run_info(&mut self) {}
+
+    fn run_buffer(&mut self, info: &RunInfo) -> Buffer<'_> {
+        let (glyphs, positions) = self
+            .builder
+            .alloc_run_pos(info.font, info.glyph_count, None);
+        Buffer::new(glyphs, positions, Point::new(self.advance_x, 0.0))
+    }
+
+    fn commit_run_buffer(&mut self, info: &RunInfo) {
+        self.advance_x += info.advance.x;
+    }
+
+    fn commit_line(&mut self) {}
+}
+
+/// Shape a run of text with HarfBuzz (via Skia's `SkShaper`) against the given
+/// font, returning the positioned glyph blob (baseline at y=0) and its total
+/// advance width.
+///
+/// Plain `Font::measure_text` / `Canvas::draw_str` map text to glyphs by a
+/// naive one-codepoint-to-one-glyph `cmap` lookup — no GSUB/GPOS is applied.
+/// Scripts whose correctness depends on OpenType shaping (Thai stacked
+/// combining marks, Arabic/Indic reordering and joining, etc.) render wrong
+/// or overlapping without it. HarfBuzz shaping is required for *all*
+/// scripts/languages to lay out correctly, not just non-Latin ones.
+fn shape_run(shaper: &Shaper, text: &str, font: &Font) -> Option<(TextBlob, f32)> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut collector = BlobCollector::new();
+    shaper.shape(text, font, true, NO_WRAP_WIDTH, &mut collector);
+    let width = collector.advance_x;
+    collector.builder.make().map(|blob| (blob, width))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load Configuration
     let config = Config {
@@ -161,8 +229,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to parse font");
 
     // Compute line height once from the base (unstyled) font
-    let line_height = Font::new(typeface.clone(), config.font_size).spacing()
-        * config.line_height_multiplier;
+    let line_height =
+        Font::new(typeface.clone(), config.font_size).spacing() * config.line_height_multiplier;
+
+    // HarfBuzz-backed shaper: correct glyph selection/positioning (ligatures,
+    // combining-mark stacking, reordering) for any script, not just Latin.
+    let shaper = Shaper::new(font_mgr.clone());
 
     // 4. Prepare IO
     let stdin = io::stdin();
@@ -238,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(sub) = &active_sub {
             let key = (sub.start, sub.end);
             if last_rendered_key != Some(key) {
-                draw_subtitle(&mut surface, sub, &config, &typeface, line_height);
+                draw_subtitle(&mut surface, sub, &config, &typeface, line_height, &shaper);
                 last_rendered_key = Some(key);
                 is_cleared = false;
                 needs_read = true;
@@ -293,6 +365,7 @@ fn draw_subtitle(
     config: &Config,
     typeface: &Typeface,
     line_height: f32,
+    shaper: &Shaper,
 ) {
     let canvas = surface.canvas();
     canvas.clear(Color::TRANSPARENT);
@@ -331,37 +404,30 @@ fn draw_subtitle(
         let y = config.baseline as f32 - (line_index_from_bottom * line_height);
 
         let runs;
-        (runs, bold_depth, italic_depth) =
-            parse_runs_stateful(line, bold_depth, italic_depth);
+        (runs, bold_depth, italic_depth) = parse_runs_stateful(line, bold_depth, italic_depth);
 
-        // Measure total line width for horizontal centering
-        let total_width: f32 = runs
+        // Shape every run up front with HarfBuzz — this both measures the
+        // line (for centering) and produces the exact glyph blob to draw,
+        // so measurement and rendering can never disagree.
+        let shaped: Vec<(TextBlob, f32)> = runs
             .iter()
-            .map(|run| {
-                styled_font(typeface, config.font_size, run.bold, run.italic)
-                    .measure_text(&run.text, Some(&text_paint))
-                    .0
+            .filter_map(|run| {
+                let font = styled_font(typeface, config.font_size, run.bold, run.italic);
+                shape_run(shaper, &run.text, &font)
             })
-            .sum();
+            .collect();
 
+        let total_width: f32 = shaped.iter().map(|(_, width)| width).sum();
         let mut x = (config.width as f32 - total_width) / 2.0;
 
-        for run in &runs {
-            let font = styled_font(typeface, config.font_size, run.bold, run.italic);
-            let run_width = font.measure_text(&run.text, Some(&text_paint)).0;
-
+        for (blob, run_width) in &shaped {
             // Draw Shadow
             if config.shadow_opacity > 0.0 {
-                canvas.draw_str(
-                    &run.text,
-                    Point::new(x + off_x, y + off_y),
-                    &font,
-                    &shadow_paint,
-                );
+                canvas.draw_text_blob(blob, Point::new(x + off_x, y + off_y), &shadow_paint);
             }
 
             // Draw Text
-            canvas.draw_str(&run.text, Point::new(x, y), &font, &text_paint);
+            canvas.draw_text_blob(blob, Point::new(x, y), &text_paint);
 
             x += run_width;
         }
@@ -575,8 +641,8 @@ mod tests {
         //   </b>  → flush "tail" as B   (depths 1,0), then bold_depth=0
         let runs = parse_runs("<b><i><b>T</b>mid</i>tail</b>");
         assert_eq!(runs.len(), 3);
-        check(&runs[0], "T",    true, true);
-        check(&runs[1], "mid",  true, true);  // italic still open at flush time
+        check(&runs[0], "T", true, true);
+        check(&runs[1], "mid", true, true); // italic still open at flush time
         check(&runs[2], "tail", true, false);
     }
 
